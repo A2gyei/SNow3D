@@ -1,0 +1,25 @@
+node_modules/
+.cache/
+tmp_ava_check/
+__pycache__/
+data/runs/
+logs/
+
+# Another member's project happens to live inside this workspace; it is not part
+# of this viewer and drags in pip/npm caches and DLLs.
+snowwork-menber-tjy/
+
+# Stray duplicates kept on disk but not published: an older copy of the release
+# screening rasters, and a solver test run that index.json never references.
+data/derived/
+
+# Reproducible artifacts. These are what make the repo heavy (~110 MB) and they
+# are rebuilt from data/source by the two commands in README "重建已发布情景":
+#   scripts/release_zones.py  -> data/analysis
+#   scripts/simulate.py       -> data/runs + data/public
+data/public/
+data/analysis/
+data/jobs/
+
+# data/source (the GLO-30 crop and the winter image) IS tracked: it is input
+# data that cannot be re-derived locally.

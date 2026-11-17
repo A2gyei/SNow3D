@@ -1,0 +1,16 @@
+{
+  "bounds": [
+    88.06,
+    47.750277777777775,
+    88.24972222222223,
+    47.9
+  ],
+  "width": 684,
+  "height": 540,
+  "source": "Copernicus DEM GLO-30",
+  "sourceDatum": "EGM2008",
+  "verticalDatum": "WGS84 ellipsoid",
+  "resolutionArcSeconds": 1,
+  "minimum": 692.395751953125,
+  "maximum": 1651.058837890625
+}
