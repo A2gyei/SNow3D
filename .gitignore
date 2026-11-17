@@ -9,6 +9,14 @@ logs/
 # of this viewer and drags in pip/npm caches and DLLs.
 snowwork-menber-tjy/
 
+# Working material that lives in this workspace but is not part of the viewer:
+# a byte-identical copy of the project under projects/, personal upload scripts,
+# and two study documents. Kept on disk, never committed.
+projects/
+.library-upload-*/
+RAMMS_Extended_*.md
+Snowwork_*.md
+
 # Stray duplicates kept on disk but not published: an older copy of the release
 # screening rasters, and a solver test run that index.json never references.
 data/derived/

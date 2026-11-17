@@ -1,8 +1,0 @@
-{
-  "name": "snowwork-3d-local",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Local AvaFrame physics-driven avalanche viewer",
-  "scripts": {"check": "node --check web/app.js"},
-  "dependencies": {"cesium": "1.135.0"}
-}
