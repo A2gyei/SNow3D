@@ -31,6 +31,16 @@ SOURCE_TEXT = {
 DISPLAY_EXAGGERATION = {"jiangjunshan": 1.5, "parabola": 1.0}
 PARTICLES_PER_CELL = 6
 FLOW_PARTICLES_PER_CELL = 96
+PLUME_PARTICLES_PER_CELL = 60
+# Vertices per solver cell for the rendered mesh. 2 -> 15 m triangles, which is
+# enough to carry the noise relief the avalanche surface needs to look like snow.
+MESH_OVERSAMPLE = 2
+# Curvature enhancement baked into the *rendered* mesh: the residual against a
+# smoothed surface is the local convexity/concavity, and amplifying it rounds the
+# ridges and deepens the gullies instead of leaving flat 30 m facets. Rendering
+# only - the solver, the slope screen and every metric keep the raw elevations.
+CURVATURE_SIGMA_PX = 2.0
+CURVATURE_GAIN = 1.35
 AREA_THRESHOLD = 0.05
 
 # x,y,z,nx,ny,nz,u,v,arrivalSeconds,peakSpeed,columnFraction,sizeRandom,seed
@@ -83,12 +93,11 @@ def _candidate_overlays(zones, header, dem, center, kind):
 
 
 def _build_particles(dem, normals, row_ids, col_ids, arrival, peak_speed, center, cell, x0, y0,
-                     seed=20261115):
-    """Bake a whole-terrain snow cloud from the solver time series.
+                     seed=20261115, min_speed=4.0):
+    """Bake the powder plume that rides above the avalanche surface.
 
-    Every display cell gets a base sprinkle so the mountain reads as snow. Cells
-    the avalanche actually reaches get extra particles, dense enough to show
-    entrained snow spraying above the flowing surface.
+    Only cells the flow reaches with a meaningful speed get particles: this is the
+    airborne snow kicked up by the front, not a mountain-wide snow layer.
     """
     rows, cols = len(row_ids), len(col_ids)
     rng = np.random.default_rng(seed)
@@ -105,11 +114,11 @@ def _build_particles(dem, normals, row_ids, col_ids, arrival, peak_speed, center
         for col in range(cols):
             native_row, native_col = row_ids[row], col_ids[col]
             arrival_s = float(arrival[native_row, native_col])
-            in_flow = np.isfinite(arrival_s) and arrival_s >= 0
-            if not in_flow:
-                arrival_s = -1.0
-            count = PARTICLES_PER_CELL + (FLOW_PARTICLES_PER_CELL if in_flow else 0)
             speed = float(peak_speed[native_row, native_col])
+            fast = np.isfinite(arrival_s) and arrival_s >= 0 and speed >= min_speed
+            if not fast:
+                continue
+            count = PLUME_PARTICLES_PER_CELL
             # Each display vertex represents a stride-by-stride native block.
             # Spread the samples across that footprint to avoid the old 3x4 dots.
             footprint = cell * display_stride
@@ -161,9 +170,11 @@ def pack_run(ava_dir, run_id, scenario, thickness, terrain="parabola", zone=None
         raise ValueError("This demo packer requires a DEM without NoData cells")
     public = ROOT / "data" / "public" / run_id
     public.mkdir(parents=True, exist_ok=True)
-    # Full DEM extent is retained; a 60 m display grid preserves terrain/flow
-    # shape without shipping every 30 m solver cell to the browser.
-    stride = 2
+    # Frames are shipped at the solver's own 30 m grid (1 MB per time step), but
+    # the *geometry* is subdivided: 30 m triangles made the avalanche read as a
+    # draped sheet, and surface relief finer than the mesh cannot exist. The mesh
+    # is therefore built on a finer grid, interpolated from the same DEM.
+    stride = 1
     row_ids = np.unique(np.append(np.arange(0, dem.shape[0], stride), dem.shape[0] - 1))
     col_ids = np.unique(np.append(np.arange(0, dem.shape[1], stride), dem.shape[1] - 1))
     sampled = dem[np.ix_(row_ids, col_ids)]
@@ -174,16 +185,39 @@ def pack_run(ava_dir, run_id, scenario, thickness, terrain="parabola", zone=None
     ys = y0 + (dem.shape[0] - 1 - row_ids) * cell
     bounds = [float(xs[0]), float(ys[-1]), float(xs[-1]), float(ys[0])]
     center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2, float(np.min(dem))]
-    xx, yy = np.meshgrid(xs - center[0], ys - center[1])
-    # The native FT is normal-to-slope thickness. Surface displacement follows
-    # the terrain normal, rather than treating FT as vertical water depth.
-    dzdy, dzdx = np.gradient(dem, -cell, cell)
-    normals = np.stack((-dzdx, -dzdy, np.ones_like(dem)), axis=-1)
-    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
-    sn = normals[np.ix_(row_ids, col_ids)]
-    positions = np.stack((xx, yy, sampled - center[2]), axis=-1)
-    vertex_data = np.concatenate((positions, sn), axis=-1).astype("<f4")
+
+    # --- geometry grid: MESH_OVERSAMPLE vertices per solver cell ---------------
+    mesh_rows = np.append(np.arange(0, dem.shape[0] - 1, 1.0 / MESH_OVERSAMPLE), dem.shape[0] - 1)
+    mesh_cols = np.append(np.arange(0, dem.shape[1] - 1, 1.0 / MESH_OVERSAMPLE), dem.shape[1] - 1)
+
+    def bilinear(grid, rows_idx, cols_idx):
+        r0 = np.clip(np.floor(rows_idx).astype(int), 0, grid.shape[0] - 1)
+        c0 = np.clip(np.floor(cols_idx).astype(int), 0, grid.shape[1] - 1)
+        r1 = np.clip(r0 + 1, 0, grid.shape[0] - 1)
+        c1 = np.clip(c0 + 1, 0, grid.shape[1] - 1)
+        fr = (rows_idx - r0)[:, None]
+        fc = (cols_idx - c0)[None, :]
+        return ((grid[np.ix_(r0, c0)] * (1 - fr) + grid[np.ix_(r1, c0)] * fr) * (1 - fc)
+                + (grid[np.ix_(r0, c1)] * (1 - fr) + grid[np.ix_(r1, c1)] * fr) * fc)
+
+    dem_mesh = bilinear(dem, mesh_rows, mesh_cols).astype(np.float32)
+    mesh_cell = cell / MESH_OVERSAMPLE
+    # Curvature enhancement: amplify the departure from a smoothed surface so the
+    # mesh carries rounded ridges and concave gullies rather than flat facets.
+    from scipy import ndimage as _ndi
+    residual = dem_mesh - _ndi.gaussian_filter(dem_mesh, CURVATURE_SIGMA_PX, mode="nearest")
+    dem_mesh = (dem_mesh + CURVATURE_GAIN * residual).astype(np.float32)
+    dzdy, dzdx = np.gradient(dem_mesh, -mesh_cell, mesh_cell)
+    mesh_normals = np.stack((-dzdx, -dzdy, np.ones_like(dem_mesh)), axis=-1)
+    mesh_normals /= np.linalg.norm(mesh_normals, axis=-1, keepdims=True)
+    mesh_xs = x0 + mesh_cols * cell
+    mesh_ys = y0 + (dem.shape[0] - 1 - mesh_rows) * cell
+    xx, yy = np.meshgrid(mesh_xs - center[0], mesh_ys - center[1])
+    positions = np.stack((xx, yy, dem_mesh - center[2]), axis=-1)
+    vertex_data = np.concatenate((positions, mesh_normals), axis=-1).astype("<f4")
     vertex_data.tofile(public / "terrain.bin")
+    mesh_width, mesh_height = len(mesh_cols), len(mesh_rows)
+    del dem_mesh, mesh_normals, positions, xx, yy, vertex_data
 
     height_scale = max(float(np.nanmax(peak_h)) * 1.01, 0.1)
     speed_scale = max(float(np.nanmax(peak_v)) * 1.01, 0.1)
@@ -242,8 +276,19 @@ def pack_run(ava_dir, run_id, scenario, thickness, terrain="parabola", zone=None
         flow_bounds = [bounds[0] - center[0], bounds[1] - center[1],
                        bounds[2] - center[0], bounds[3] - center[1]]
 
-    particles = _build_particles(dem, normals, row_ids, col_ids, arrival, peak_speed, center, cell, x0, y0)
-    particles.tofile(public / "snow.bin")
+    # The whole-mountain snow cloud is retired: the avalanche itself is rendered
+    # as a shaded surface, so the particle buffer is no longer shipped.
+    # Native-grid normals, still needed for the powder plume positions.
+    dzdy_n, dzdx_n = np.gradient(dem, -cell, cell)
+    normals = np.stack((-dzdx_n, -dzdy_n, np.ones_like(dem)), axis=-1)
+    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+
+    # Powder plume removed: soft sprites over the body read as haze. Nothing is
+    # written and no snow.bin is shipped.
+    particles = np.empty(0, dtype="<f4")
+    stale = public / "snow.bin"
+    if stale.exists():
+        stale.unlink()
 
     albedo = None
     if terrain == "jiangjunshan":
@@ -312,6 +357,8 @@ def pack_run(ava_dir, run_id, scenario, thickness, terrain="parabola", zone=None
         "source": SOURCE_TEXT.get(terrain, SOURCE_TEXT["parabola"]),
         "nativeCellSize": cell, "displayStride": stride, "bounds": bounds, "origin": center,
         "width": len(col_ids), "height": len(row_ids), "terrainLayout": "float32 LE x,y,z,nx,ny,nz",
+        # Mesh is finer than the frame textures; both cover the same extent.
+        "meshWidth": mesh_width, "meshHeight": mesh_height, "meshCellSize": cell / MESH_OVERSAMPLE,
         "frameLayout": "RGBA8: h_uint16=R*256+G; v_uint16=B*256+A; north-to-south rows",
         "frameBytes": frame_bytes, "heightScale": height_scale, "speedScale": speed_scale,
         "heightMin": float(sampled.min() - center[2]), "heightMax": float(sampled.max() - center[2]),
@@ -326,9 +373,9 @@ def pack_run(ava_dir, run_id, scenario, thickness, terrain="parabola", zone=None
         "snowpack": {"entrainableDepthM": snow_depth, "state": "static -> flowing -> deposited"},
         "mass": mass_summary,
         "flowBounds": flow_bounds,
-        "particles": {"count": int(particles.shape[0]), "stride": PARTICLE_STRIDE,
-                      "layout": PARTICLE_LAYOUT, "bytes": int(particles.nbytes),
-                      "url": f"/data/{run_id}/snow.bin"},
+        "particles": ({"count": int(particles.shape[0]), "stride": PARTICLE_STRIDE,
+                       "layout": PARTICLE_LAYOUT, "bytes": int(particles.nbytes),
+                       "url": f"/data/{run_id}/snow.bin"} if particles.size else None),
         "albedo": albedo,
     }
     if lonlat is None and terrain == "jiangjunshan":

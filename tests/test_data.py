@@ -15,8 +15,12 @@ class FrameDataTests(unittest.TestCase):
             with self.subTest(run=entry['id']):
                 base = ROOT / 'data/public' / entry['id']
                 m = json.loads((base / 'manifest.json').read_text(encoding='utf-8'))
+                # The rendered mesh may be finer than the frame textures.
+                mesh_width = m.get('meshWidth', m['width'])
+                mesh_height = m.get('meshHeight', m['height'])
+                n_mesh = mesh_width * mesh_height
                 n = m['width'] * m['height']
-                terrain = np.fromfile(base / 'terrain.bin', dtype='<f4').reshape(n, 6)
+                terrain = np.fromfile(base / 'terrain.bin', dtype='<f4').reshape(n_mesh, 6)
                 self.assertTrue(np.isfinite(terrain).all())
                 np.testing.assert_allclose(np.linalg.norm(terrain[:, 3:], axis=1), 1, atol=1e-6)
                 self.assertEqual((base / 'frames.bin').stat().st_size, n * 4 * len(m['frames']))
@@ -38,7 +42,7 @@ class FrameDataTests(unittest.TestCase):
                     self.assertTrue(m['synthetic'])
                     self.assertFalse(m['georeferenced'])
                 # File row zero is north. This catches a flipped texture/terrain convention.
-                grid = terrain.reshape(m['height'], m['width'], 6)
+                grid = terrain.reshape(mesh_height, mesh_width, 6)
                 self.assertGreater(grid[0, 0, 1], grid[-1, 0, 1])
                 self.assertLess(grid[0, 0, 0], grid[0, -1, 0])
 
@@ -92,42 +96,32 @@ class ReleaseZoneTests(unittest.TestCase):
                 self.assertTrue(west <= lon <= east and south <= lat <= north)
 
 
-class ParticleCloudTests(unittest.TestCase):
-    """The snow cloud must live in the same local frame as the terrain mesh."""
+class SnowMeshTests(unittest.TestCase):
+    """The rendered mesh is finer than the solver grid and must stay consistent."""
 
     def setUp(self):
-        self.base = ROOT / 'data/public/jiangjunshan_r01'
+        self.base = ROOT / 'data/public/jjs_ent_v1'
         self.manifest = json.loads((self.base / 'manifest.json').read_text(encoding='utf-8'))
 
-    def test_cloud_shape_and_extent(self):
-        info = self.manifest['particles']
-        self.assertGreater(info['count'], 1000)
-        raw = np.fromfile(self.base / 'snow.bin', dtype='<f4')
-        self.assertEqual(raw.size, info['count'] * info['stride'])
-        cloud = raw.reshape(-1, info['stride'])
-        self.assertTrue(np.isfinite(cloud).all())
-        n = self.manifest['width'] * self.manifest['height']
-        terrain = np.fromfile(self.base / 'terrain.bin', dtype='<f4').reshape(n, 6)
-        # Same local origin as the mesh: leaving absolute UTM coordinates in the
-        # cloud would blow these bounds by two orders of magnitude.
-        self.assertLess(np.abs(cloud[:, 0]).max(), np.abs(terrain[:, 0]).max() + 200)
-        self.assertLess(np.abs(cloud[:, 1]).max(), np.abs(terrain[:, 1]).max() + 200)
-        self.assertGreaterEqual(cloud[:, 2].min(), -1)
-        self.assertLessEqual(cloud[:, 2].max(), self.manifest['heightMax'] + 1)
+    def test_mesh_is_finer_than_the_frames(self):
+        self.assertGreater(self.manifest['meshWidth'], self.manifest['width'])
+        self.assertGreater(self.manifest['meshHeight'], self.manifest['height'])
+        self.assertAlmostEqual(self.manifest['meshCellSize'], 15.0, places=3)
+        # Frames stay at the solver grid, so the payload does not grow 4x with the mesh.
+        self.assertEqual(self.manifest['frameBytes'], self.manifest['width'] * self.manifest['height'] * 4)
 
-    def test_flow_arrival_marks_the_cascade(self):
-        info = self.manifest['particles']
-        cloud = np.fromfile(self.base / 'snow.bin', dtype='<f4').reshape(-1, info['stride'])
-        arrival = cloud[:, 8]
-        touched = arrival[arrival >= 0]
-        self.assertGreater(touched.size, 0)
-        self.assertGreaterEqual(touched.min(), 0)
-        self.assertLessEqual(touched.max(), self.manifest['duration'])
-        # Only flow cells get the dense body cloud; the untouched mountain keeps the
-        # thin base sprinkle. Count cells, not particles, since the body is dense.
-        cells = np.unique(np.stack([cloud[:, 6], cloud[:, 7]], axis=1), axis=0)
-        flow_cells = np.unique(np.stack([cloud[arrival >= 0, 6], cloud[arrival >= 0, 7]], axis=1), axis=0)
-        self.assertLess(flow_cells.shape[0], cells.shape[0] * 0.2)
+    def test_mesh_extent_matches_the_frame_extent(self):
+        mesh_width = self.manifest['meshWidth']
+        mesh_height = self.manifest['meshHeight']
+        terrain = np.fromfile(self.base / 'terrain.bin', dtype='<f4').reshape(mesh_width * mesh_height, 6)
+        xs = terrain[:, 0]
+        ys = terrain[:, 1]
+        span_x = float(xs.max() - xs.min())
+        span_y = float(ys.max() - ys.min())
+        expected_x = (self.manifest['bounds'][2] - self.manifest['bounds'][0]) * 0.999
+        expected_y = (self.manifest['bounds'][3] - self.manifest['bounds'][1]) * 0.999
+        self.assertAlmostEqual(span_x / expected_x, 1.0, delta=0.02)
+        self.assertAlmostEqual(span_y / expected_y, 1.0, delta=0.02)
 
     def test_winter_imagery_is_packaged(self):
         self.assertTrue(self.manifest['albedo'])

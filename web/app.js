@@ -51,7 +51,26 @@ out vec3 v_local;
 out vec2 v_uv;
 out float v_height;
 out float v_speed;
+out float v_bump;
 uniform float u_vertical;
+float vhash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(vhash(i), vhash(i + vec2(1.0, 0.0)), u.x),
+               mix(vhash(i + vec2(0.0, 1.0)), vhash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+// Rendering-only micro-relief. The mesh already carries real curvature baked at
+// pack time; this only adds the sub-mesh grain that a 15 m triangle cannot hold.
+float microRelief(vec2 xy, vec3 nrm) {
+    float slope = clamp(1.0 - nrm.z, 0.0, 1.0);
+    float medium = vnoise(xy * 0.045) - 0.5;      // ~22 m
+    float fine = vnoise(xy * 0.11) - 0.5;         // ~9 m
+    return (medium * 0.35 + fine * 0.18) * slope;
+}
 #ifdef SNOW
 uniform sampler2D u_frameA;
 uniform sampler2D u_frameB;
@@ -67,13 +86,26 @@ void main() {
     vec3 p = position;
     v_height = 0.0;
     v_speed = 0.0;
+    // Both surfaces share the same synthesised terrain texture, so the snow keeps
+    // sitting exactly on the ground underneath it.
+    float relief = microRelief(position.xy, normal);
+    p.z += relief;
 #ifdef SNOW
     vec2 a = decodeState(texture(u_frameA, st));
     vec2 b = decodeState(texture(u_frameB, st));
     vec2 value = mix(a, b, u_mix);
     v_height = value.x * u_heightScale;
     v_speed = value.y * u_speedScale;
-    p += normal * (v_height * u_exaggeration + 0.2);
+    // Loose snow is not a smooth offset of the ground: displace the surface with
+    // two octaves of noise so the mass has real lumps, ribs and a ragged rim.
+    // Frequencies stay above the mesh Nyquist limit (15 m triangles -> >=30 m).
+    float cov = smoothstep(0.008, 0.42, v_height);
+    float lumps = (vnoise(position.xy * 0.012) - 0.5) * 2.6;
+    float packs = (vnoise(position.xy * 0.030) - 0.5) * 1.0;
+    v_bump = (lumps + packs) * cov;
+    p += normal * (v_height * u_exaggeration + 0.2 + v_bump);
+#else
+    v_bump = 0.0;
 #endif
     // Display-only vertical stretch: terrain and snow share it, so the snow
     // surface stays glued to the DEM. Packaged data stays in raw metres.
@@ -90,11 +122,13 @@ in vec3 v_local;
 in vec2 v_uv;
 in float v_height;
 in float v_speed;
+in float v_bump;
 uniform float u_mode;
 uniform float u_heightScale;
 uniform float u_speedScale;
 uniform float u_vertical;
 uniform float u_relief;
+uniform float u_time;
 uniform sampler2D u_albedo;
 uniform float u_hasAlbedo;
 vec3 ramp(float value) {
@@ -103,6 +137,16 @@ vec3 ramp(float value) {
     vec3 warm = mix(vec3(.91,.88,.53), vec3(.94,.40,.34), smoothstep(.62,1.0,value));
     return mix(cold, warm, smoothstep(.30,.66,value));
 }
+float hash12(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+float valueNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash12(i), hash12(i + vec2(1.0, 0.0)), u.x),
+               mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x), u.y);
+}
 void main() {
     // The stored normals describe the raw DEM; stretching z rotates them.
     vec3 n = normalize(vec3(v_normal.xy * u_vertical, v_normal.z));
@@ -110,28 +154,51 @@ void main() {
     vec3 color;
     float alpha = 1.0;
 #ifdef SNOW
-    if (v_height < 0.035) discard;
-    vec3 detailedNormal = normalize(cross(dFdx(v_local), dFdy(v_local)));
-    float snowLight = .73 + .27 * abs(dot(detailedNormal, light));
-    // Same snow material as the synthetic baseline: a lit white mass that reads
-    // as packed snow. The low-depth end stays pale snow instead of turning into
-    // an icy teal sheet, which is what made it look unlike the baseline.
-    color = mix(vec3(.70,.82,.90), vec3(.94,.97,.98), smoothstep(.0,.55,v_height));
+    // The outline follows the interpolated height field, not the texel grid, so
+    // the avalanche silhouette is a smooth contour instead of a staircase.
+    float coverage = smoothstep(0.008, 0.42, v_height);
+    if (coverage <= 0.001) discard;
+
+    // Smooth base normal, tilted by the slope of the displaced surface so the
+    // lumps cast real light and shade instead of reading as a flat sheet.
+    vec3 nSnow = normalize(n + vec3(-dFdx(v_bump), -dFdy(v_bump), 0.0) * 3.0);
+
+    float lambert = max(dot(nSnow, light), 0.0);
+    float sky = 0.5 + 0.5 * nSnow.z;
+    // Strong contrast: snow in shadow goes cold blue-grey, sunlit faces stay
+    // white. Without this the lumps read as one flat sheet of white.
+    vec3 lit = mix(vec3(0.30, 0.40, 0.56), vec3(1.0), pow(lambert, 0.75));
+    lit = mix(lit, vec3(1.0), sky * 0.12);
+
     if (u_mode > .5 && u_mode < 1.5) color = ramp(v_speed / u_speedScale);
-    if (u_mode > 1.5) color = ramp(v_height / u_heightScale);
-    color *= snowLight;
-    float front = 1.0 - smoothstep(.035,.22,v_height);
-    color = mix(color, vec3(.88,.97,.98), front*.25);
-    alpha = mix(.48, .78, smoothstep(.04, .65, v_height));
+    else if (u_mode > 1.5) color = ramp(v_height / u_heightScale);
+    else color = mix(vec3(0.93, 0.96, 1.0), vec3(1.0), smoothstep(0.2, 2.0, v_height));
+    color *= lit;
+    // Thicker snow reads denser and slightly brighter than the thin tongue.
+    color *= 0.90 + 0.10 * smoothstep(0.0, 2.2, v_height);
+
+    // The advancing lip: where the depth rises fastest the snow piles up and
+    // catches the light, which is what makes a front read as a front.
+    float shoulder = length(vec2(dFdx(v_height), dFdy(v_height)));
+    float lip = smoothstep(0.015, 0.20, shoulder) * coverage;
+    color += vec3(0.14, 0.18, 0.22) * lip;
+
+    vec3 viewDir = normalize(vec3(0.2, 0.35, 0.91));
+    color += pow(max(dot(reflect(-light, nSnow), viewDir), 0.0), 28.0) * vec3(0.26);
+
+    // Solid snow: fully opaque everywhere except a hairline feather at the rim,
+    // so the body reads as a mass instead of a sheet of glass.
+    alpha = mix(0.62, 1.0, smoothstep(0.004, 0.05, v_height));
 #else
     vec3 albedo = vec3(.80,.85,.90);
     if (u_hasAlbedo > .5) albedo = texture(u_albedo, v_uv).rgb;
-    // Sky/ground split: snowfields read bright, shaded faces keep a cold cast.
-    float shadowMask = 0.5 - 0.5 * n.z;
-    vec3 sky = vec3(.34,.44,.56) + vec3(.12,.10,.06) * smoothstep(-.2,.7,n.y);
+    // Snow ground: warm-white where the sun hits, cold blue in the hollows. That
+    // contrast is what lets a white avalanche read against a white mountain.
     float lambert = max(dot(n, light), 0.0);
-    vec3 shade = mix(sky, vec3(1.0), lambert * .82 + .18);
-    color = albedo * shade;
+    vec3 lit = mix(vec3(0.44, 0.54, 0.70), vec3(1.0, 1.0, 1.0), lambert * 0.80 + 0.20);
+    float upness = clamp(n.z * 0.5 + 0.5, 0.0, 1.0);
+    lit = mix(lit, vec3(0.98, 0.99, 1.0), upness * 0.28);
+    color = albedo * lit * 0.92;
     // A touch of aerial perspective with distance keeps the ridge readable.
     float distance = length(v_local.xy) / max(u_relief * 9.0, 1.0);
     color = mix(color, vec3(.36,.47,.58), clamp(distance, 0.0, 1.0) * .28);
@@ -152,6 +219,7 @@ class FieldMesh {
     this.mode = 0;
     this.exaggeration = 3;
     this.vertical = 1;
+    this.time = 0;
     this.albedo = null;
     this.albedoImage = null;
     this.drawSurface = true;
@@ -175,13 +243,17 @@ class FieldMesh {
     return texture;
   }
   build(context) {
-    const { width, height } = this.manifest;
+    // Geometry may be finer than the frame textures: meshWidth/Height describe the
+    // vertices, width/height describe the depth/velocity images.
+    const textureWidth = this.manifest.width, textureHeight = this.manifest.height;
+    const width = this.manifest.meshWidth ?? textureWidth;
+    const height = this.manifest.meshHeight ?? textureHeight;
     const count = width * height;
     const uv = new Float32Array(count * 2);
     for (let row = 0; row < height; row++) for (let col = 0; col < width; col++) {
       const offset = (row * width + col) * 2;
-      uv[offset] = (col + .5) / width;
-      uv[offset + 1] = (row + .5) / height;
+      uv[offset] = col / (width - 1 || 1);
+      uv[offset + 1] = row / (height - 1 || 1);
     }
     const indices = new Uint32Array((width - 1) * (height - 1) * 6);
     let k = 0;
@@ -229,6 +301,7 @@ class FieldMesh {
       u_exaggeration: () => this.exaggeration,
       u_vertical: () => this.vertical,
       u_relief: () => Math.max((this.manifest.heightMax - this.manifest.heightMin) * this.vertical, 1),
+      u_time: () => this.time,
       u_mix: () => this.mix,
       u_frameA: () => this.frameA,
       u_frameB: () => this.frameB,
@@ -312,39 +385,28 @@ void main() {
     vec2 value = mix(decodeState(texture(u_frameA, st)), decodeState(texture(u_frameB, st)), u_mix);
     float depth = value.x * u_heightScale;
     float speed = value.y * u_speedScale;
-    float inFlow = smoothstep(0.03, 0.22, depth);
     float arrived = (flow.x >= 0.0 && u_time >= flow.x) ? 1.0 : 0.0;
     float since = max(u_time - max(flow.x, 0.0), 0.0);
-    float moving = arrived * inFlow;
-    float deposited = arrived * (1.0 - inFlow);
+    float flowing = arrived * smoothstep(0.04, 0.55, depth);
 
-    // Downhill is the horizontal component of the surface normal, so entrained
-    // snow slides along the slope instead of drifting in a random direction.
-    vec2 downhill = normalize(-normal.xy + vec2(1.0e-4, 1.0e-4));
+    // Airborne powder: it rides above the flowing surface and drifts downslope
+    // with the front. Nothing here contributes to the body - the body is the
+    // shaded surface underneath.
     vec3 p = position;
-    float travel = min(since, 5.0);
-    float carrySpeed = min(max(speed, flow.y * 0.25), 12.0);
-    p.xy += downhill * travel * carrySpeed * moving * 0.22;
-
-    // The flow body IS this cloud: each particle fills a slot inside the moving
-    // layer (flow.z = 0 at the bed, 1 at the surface) instead of hovering above
-    // a rendered surface.
-    float thick = max(depth, 0.02) * u_exaggeration;
-    float restingLift = 0.10 + 0.16 * flow.w;
-    float columnLift = 0.08 + thick * (0.10 + 0.90 * flow.z);
-    p += normal * mix(restingLift, columnLift, moving);
+    float thick = max(depth, 0.25) * u_exaggeration;
+    float rise = 1.6 + flow.z * (thick * 1.6 + 7.0);
+    p += normal * rise;
+    vec2 downhill = normalize(-normal.xy + vec2(1.0e-4, 1.0e-4));
+    p.xy += downhill * min(since, 10.0) * (2.0 + min(speed, 20.0) * 0.25) * flowing;
     p.z *= u_vertical;
 
-    vec3 snow = mix(vec3(.70,.82,.90), vec3(.97,.99,1.0), smoothstep(.0,.55,depth));
-    if (u_mode > 1.5) snow = ramp(depth / u_heightScale);
-    else if (u_mode > .5) snow = ramp(speed / u_speedScale);
-    v_color = mix(vec3(0.92, 0.96, 1.0), snow, max(moving, deposited * 0.55));
-    v_alpha = mix(0.30, 0.72, moving);
+    v_color = vec3(0.98, 0.99, 1.0);
+    v_alpha = mix(0.04, 0.13, flowing) * (0.6 + 0.4 * flow.w);
 
     vec4 mv = czm_modelView * vec4(p, 1.0);
     gl_Position = czm_projection * mv;
-    float sizeMul = mix(0.65 + flow.w * 0.30, 0.95 + flow.w * 0.45, moving);
-    gl_PointSize = clamp(u_size * sizeMul * 1900.0 / max(-mv.z, 1.0), 1.2, 8.0);
+    float sizeMul = 1.1 + flow.w * 1.6;
+    gl_PointSize = clamp(u_size * sizeMul * 1900.0 / max(-mv.z, 1.0), 1.2, 26.0);
 }`;
 
 const particleFragmentShader = `
@@ -512,33 +574,65 @@ function setCamera(kind = 'oblique') {
   if (!state.manifest) return;
   const { cx, cy, spanX, spanY, span, relief } = sceneFrame();
   const close = kind === 'close';
-  orbit.target = new C.Cartesian3(cx, cy, relief * (close ? 0.5 : 0.42));
-  orbit.heading = C.Math.toRadians(kind === 'top' ? 0 : close ? 336 : 322);
-  orbit.pitch = C.Math.toRadians(kind === 'top' ? -89.8 : close ? -24 : -36);
+  orbit.target = new C.Cartesian3(cx, cy, relief * (close ? 0.62 : 0.42));
+  orbit.heading = C.Math.toRadians(kind === 'top' ? 0 : close ? 340 : 322);
+  orbit.pitch = C.Math.toRadians(kind === 'top' ? -89.8 : close ? -19 : -36);
   orbit.range = kind === 'top'
     ? Math.max(spanX * 1.5, spanY * 1.05)
-    : close ? span * 0.95 : span * 2.4;
+    : close ? span * 0.55 : span * 2.4;
   applyOrbit();
   $('view-top').classList.toggle('active', kind === 'top');
   $('view-close').classList.toggle('active', close);
   $('view-oblique').classList.toggle('active', kind !== 'top' && !close);
 }
 
+// Current snow thickness at a local (x,y) point, read straight out of the packed
+// frame texture so the outlines can ride on top of the flowing surface.
+function depthAt(x, y) {
+  const m = state.manifest;
+  if (!m || !snowPrimitive || !snowPrimitive.binary) return 0;
+  const index = Math.max(0, state.frameIndex);
+  const frame = m.frames[index];
+  if (!frame) return 0;
+  const west = m.bounds[0] - m.origin[0], east = m.bounds[2] - m.origin[0];
+  const south = m.bounds[1] - m.origin[1], north = m.bounds[3] - m.origin[1];
+  const u = (x - west) / Math.max(east - west, 1e-6);
+  const v = (north - y) / Math.max(north - south, 1e-6);
+  if (u < 0 || u > 1 || v < 0 || v > 1) return 0;
+  const col = Math.min(m.width - 1, Math.max(0, Math.floor(u * m.width)));
+  const row = Math.min(m.height - 1, Math.max(0, Math.floor(v * m.height)));
+  const offset = ((index * m.height + row) * m.width + col) * 4;
+  const bytes = new Uint8Array(snowPrimitive.binary, offset, 4);
+  const height16 = bytes[0] * 256 + bytes[1];
+  return (height16 / 65535) * m.heightScale;
+}
+
 function createOverlays(manifest) {
   for (const entity of overlays) viewer.entities.remove(entity);
   overlays = [];
+  const runZone = manifest.zone?.id || null;
   for (const overlay of manifest.overlays) {
     if (overlay.kind === 'resistance' && manifest.scenario !== 'res') continue;
+    // The release outline and the selected candidate are the same polygon once a
+    // zone has been solved, so draw it once (as the candidate) instead of twice.
+    if (overlay.kind === 'release' && runZone) continue;
     const candidate = overlay.kind === 'candidate';
     const selected = candidate && overlay.id === state.zone;
+    const isRelease = candidate && overlay.id === runZone;
     const color = C.Color.fromCssColorString(
       candidate ? (selected ? '#ffd166' : '#7f93a8')
         : overlay.kind === 'release' ? '#ffc788' : '#9d9cfe');
+    // Ride above the snow: terrain elevation + current thickness * display scale,
+    // then the same vertical exaggeration the mesh applies in its shader.
+    const lift = (point) =>
+      (point[2] + depthAt(point[0], point[1]) * state.heightScale + 6) * state.vertical;
     const entity = viewer.entities.add({
-      polyline: { positions: overlay.points.map((p) => position(...p)),
+      polyline: {
+        positions: new C.CallbackProperty(
+          () => overlay.points.map((p) => position(p[0], p[1], lift(p))), false),
         width: candidate ? (selected ? 3.6 : 1.4) : 2.5,
         material: new C.PolylineDashMaterialProperty({ color, dashLength: candidate ? 8 : 14 }),
-        depthFailMaterial: color.withAlpha(.3) },
+        depthFailMaterial: color.withAlpha(.55) },
     });
     entity.overlayKind = overlay.kind;
     entity.candidateId = overlay.id || null;
@@ -547,9 +641,12 @@ function createOverlays(manifest) {
     // and the release outline get a caption.
     if (candidate && !selected) continue;
     const point = overlay.points[0];
-    const text = candidate ? `高危起崩区 ${overlay.id}`
-      : overlay.kind === 'release' ? '初始释放区' : '阻力区';
-    const label = viewer.entities.add({ position: position(point[0], point[1], point[2] + 32),
+    const text = isRelease ? `初始释放区 · ${overlay.id}`
+      : candidate ? `高危起崩区 ${overlay.id}`
+        : overlay.kind === 'release' ? '初始释放区' : '阻力区';
+    const label = viewer.entities.add({
+      position: new C.CallbackProperty(
+        () => position(point[0], point[1], lift(point) + 12), false),
       label: { text,
         font: '12px Microsoft YaHei', fillColor: color, style: C.LabelStyle.FILL_AND_OUTLINE,
         outlineColor: C.Color.fromCssColorString('#10202b'), outlineWidth: 4,
@@ -601,7 +698,8 @@ async function loadScenario(id) {
     ];
     const [terrainBuffer, framesBuffer, snowBuffer, albedoImage] = await Promise.all(requests);
     if (token !== loadToken) return;
-    if (terrainBuffer.byteLength !== manifest.width * manifest.height * 6 * 4 || framesBuffer.byteLength !== manifest.frameBytes * manifest.frames.length) throw new Error('数据长度与清单不一致，请重新转换计算结果');
+    const meshVertices = (manifest.meshWidth ?? manifest.width) * (manifest.meshHeight ?? manifest.height);
+    if (terrainBuffer.byteLength !== meshVertices * 6 * 4 || framesBuffer.byteLength !== manifest.frameBytes * manifest.frames.length) throw new Error('数据长度与清单不一致，请重新转换计算结果');
     if (snowBuffer && snowBuffer.byteLength !== manifest.particles.bytes) throw new Error('雪粒子数据长度与清单不一致，请重新转换计算结果');
     if (!viewer) createViewer();
     if (terrainPrimitive) viewer.scene.primitives.remove(terrainPrimitive);
@@ -613,13 +711,13 @@ async function loadScenario(id) {
     particlePrimitive = null;
     terrainPrimitive.albedoImage = albedoImage;
     terrainPrimitive.vertical = manifest.verticalExaggeration ?? 1.0;
-    // The flowing body is rendered as a particle mass now; the snow mesh is only
-    // kept alive to upload the depth/velocity textures. Scenarios published before
-    // the particle cloud existed still draw the mesh.
-    // Keep the coherent computed flow sheet underneath the grains; particles
-    // now express transport and deposition instead of replacing the body.
+    // The avalanche body is a shaded surface again; the whole-mountain particle
+    // cloud is retired, so there is nothing else to upload.
     snowPrimitive.drawSurface = true;
-    if (snowBuffer) {
+    // Powder plume disabled: the soft sprites read as haze over the surface
+    // rather than as snow. The avalanche is a solid shaded body only.
+    particlePrimitive = null;
+    if (false && snowBuffer) {
       particlePrimitive = viewer.scene.primitives.add(new SnowParticles(manifest, snowBuffer));
       particlePrimitive.show = $('show-particles').checked;
     }
@@ -668,6 +766,7 @@ function updateFrame(force = false) {
   const interval = m.frames[b].t - m.frames[a].t;
   snowPrimitive.mix = interval ? Math.min(1, Math.max(0, (state.time - m.frames[a].t) / interval)) : 0;
   snowPrimitive.exaggeration = state.heightScale;
+  snowPrimitive.time = state.time;
   snowPrimitive.setPair(a, b);
   if (particlePrimitive) {
     particlePrimitive.setPair(a, b);
